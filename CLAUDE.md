@@ -2,7 +2,7 @@
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
 multi-module project. REST communication, RabbitMQ messaging, automated tests, Docker packaging,
-and CI are all done (see Phase Plan below); no CD or monitoring yet.
+and CI/CD are all done (see Phase Plan below); no monitoring yet.
 
 ## Architecture
 
@@ -338,6 +338,66 @@ quirk and isn't referenced anywhere in committed config (the surefire `-Dapi.ver
 is harmless/generic and works fine on Linux too, since it just forces a modern API version
 request that any reasonably current Docker Engine accepts).
 
+## CD (phase 5 — done)
+
+`.github/workflows/cd.yml` — publishes images to Docker Hub. Two jobs:
+
+1. **`build-and-push`** — matrix over all 5 services. Logs into Docker Hub
+   (`docker/login-action`, using the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets), builds
+   each service's image from its existing `Dockerfile`, tags it two ways, and pushes both tags.
+2. **`post-deploy-health-check`** — `needs: build-and-push` (only runs once every image is
+   pushed). Pulls the just-published images via `docker-compose.prod.yml` and brings up the whole
+   stack (`docker compose up -d --wait`), then explicitly curls each of the 5 services'
+   `/actuator/health` endpoint and fails the job if any isn't `UP`. Tears the stack down
+   (`docker compose down -v`) in an `if: always()` step so a failed health check still cleans up
+   instead of leaving containers running on the runner.
+
+**Trigger — merge only, not every push**: `on: pull_request: types: [closed], branches: [main]`
+with `if: github.event.pull_request.merged == true` at the job level. A PR that's closed *without*
+merging does not trigger this — only an actual merge into `main` does. This is deliberately
+different from CI's "every push" trigger: CD publishes real artifacts to a real registry, so it
+should only fire on the one event that means "this is now what's on main."
+
+**Why `github.event.pull_request.merge_commit_sha`, not `github.sha`**: for a `pull_request`
+event, `github.sha`/the default checkout ref point at the last commit on the PR's *head* branch,
+not necessarily the actual merge commit that landed on `main` (these can differ depending on merge
+strategy). Both jobs explicitly check out and tag from
+`github.event.pull_request.merge_commit_sha` so what gets built, tagged, and health-checked is
+exactly what's now on `main`.
+
+**Image naming & tagging convention**: `<dockerhub-username>/devops-<service-name>`, tagged both
+`:latest` and `:<short-sha>` (first 7 chars of the merge commit SHA):
+```
+<dockerhub-username>/devops-api-gateway:latest
+<dockerhub-username>/devops-api-gateway:a1b2c3d
+<dockerhub-username>/devops-user-service:latest
+<dockerhub-username>/devops-user-service:a1b2c3d
+... (same pattern × catalog-service, order-service, notification-service)
+```
+The `:latest` tag is "whatever main currently is"; the short-SHA tag is for traceability — you can
+always point at exactly the commit a given running container was built from.
+
+**`docker-compose.prod.yml`** (repo root) — same postgres/rabbitmq/network/volume shape as
+`docker-compose.yml`, but the 5 app services use `image: ${DOCKERHUB_USERNAME}/devops-<service>:${TAG:-latest}`
+instead of `build:`. This is the actual "deploy" story for running the published images anywhere,
+including for the university defense — pull and run locally:
+```bash
+export DOCKERHUB_USERNAME=<your-dockerhub-username>
+# TAG defaults to "latest" if unset; set it to a short SHA to pin an exact build
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml ps    # wait for all "healthy"
+```
+Distinct ports from both the manual dev setup and the build-from-source `docker-compose.yml`, so
+all three can run side by side without conflict: Postgres on **5435**, RabbitMQ on
+**5675**/**15675**, app services on the same **9080-9084** (they're still "the same services").
+Tear down with `docker compose -f docker-compose.prod.yml down -v`.
+
+**Not done**: no rollback mechanism, no blue/green or canary deploy, no actual remote server this
+gets deployed to — "deploy" here means "publish images + prove the stack starts and reports
+healthy," not deploying to any real infrastructure. Flagging in case that's expected for a later
+phase or the grading rubric.
+
 ## Git workflow (going forward)
 
 Starting from the CI phase: **feature branch → pull request into `main` → CI runs automatically →
@@ -367,7 +427,8 @@ before this workflow started — see the phase plan below for what each of those
    service and the Windows Docker/Testcontainers gotcha.
 4. **Docker** — done (2026-07-03). See "Docker" section above for the Dockerfile pattern, Compose
    topology, port-mapping distinction from the manual dev setup, and the three real bugs it caught.
-5. **CI/CD** — CI half done (2026-07-03): see "CI" section above for the workflow's triggers and
-   jobs. CD (pushing images to a registry and/or auto-deploying) *(next)*.
-6. **Monitoring** — Spring Boot Actuator health/metrics endpoints (already added for health checks
-   in phase 4), likely Prometheus + Grafana for scraping/visualizing.
+5. **CI/CD** — done (2026-07-03). See "CI" and "CD" sections above — CI builds/tests/build-only
+   Docker images on every push and PR; CD publishes tagged images to Docker Hub and runs a
+   post-deploy health check, triggered only on an actual merge into `main`.
+6. **Monitoring** *(next)* — Spring Boot Actuator health/metrics endpoints (already added for
+   health checks in phase 4), likely Prometheus + Grafana for scraping/visualizing.

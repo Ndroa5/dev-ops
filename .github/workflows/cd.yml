@@ -1,0 +1,91 @@
+name: CD
+
+# Only fires on an actual PR merge into main - not on every push (pushing directly to main
+# shouldn't happen per the git workflow in CLAUDE.md, but even if it did, this workflow
+# deliberately wouldn't react to it). `github.event.pull_request.merged == true` is what
+# distinguishes "merged" from "closed without merging".
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build & push (${{ matrix.service }})
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - user-service
+          - catalog-service
+          - order-service
+          - notification-service
+    steps:
+      - name: Check out merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image (tagged with short SHA and latest)
+        run: |
+          SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          docker build -f ${{ matrix.service }}/Dockerfile \
+            -t "${{ secrets.DOCKERHUB_USERNAME }}/devops-${{ matrix.service }}:${SHORT_SHA}" \
+            -t "${{ secrets.DOCKERHUB_USERNAME }}/devops-${{ matrix.service }}:latest" \
+            .
+
+      - name: Push both tags to Docker Hub
+        run: docker push --all-tags "${{ secrets.DOCKERHUB_USERNAME }}/devops-${{ matrix.service }}"
+
+  post-deploy-health-check:
+    name: Post-deploy health check
+    needs: build-and-push
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Compute short SHA tag
+        run: |
+          SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          echo "TAG=${SHA:0:7}" >> "$GITHUB_ENV"
+
+      - name: Pull freshly-published images and start the stack
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          docker compose -f docker-compose.prod.yml pull
+          docker compose -f docker-compose.prod.yml up -d --wait --wait-timeout 180
+
+      - name: Hit each service's /actuator/health endpoint
+        run: |
+          set -e
+          for port in 9080 9081 9082 9083 9084; do
+            echo "Checking service on port ${port}..."
+            status=$(curl -sf "http://localhost:${port}/actuator/health" | tee /dev/stderr | grep -o '"status":"[A-Z]*"')
+            echo "$status" | grep -q '"status":"UP"' || { echo "Service on port ${port} is not UP"; exit 1; }
+          done
+          echo "All 5 services report UP."
+
+      - name: Tear down the stack
+        if: always()
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: docker compose -f docker-compose.prod.yml down -v
