@@ -5,9 +5,9 @@ spring:
   application:
     name: user-service
   datasource:
-    url: jdbc:postgresql://localhost:5433/userdb
-    username: postgres
-    password: postgres
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5433}/userdb
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
   jpa:
     hibernate:
       ddl-auto: update
@@ -17,8 +17,14 @@ spring:
         format_sql: true
 
 jwt:
-  secret: "change-this-development-secret-key-to-something-long-and-random"
-  expiration-ms: 3600000
+  secret: ${JWT_SECRET:change-this-development-secret-key-to-something-long-and-random}
+  expiration-ms: ${JWT_EXPIRATION_MS:3600000}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
 
 logging:
   level:

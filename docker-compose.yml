@@ -1,0 +1,201 @@
+networks:
+  devops-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: compose-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: compose-rabbitmq
+    environment:
+      # On this machine's Docker Desktop (Windows/WSL2), a first-boot race in the image's
+      # entrypoint can leave .erlang.cookie owned root:root/mode 400 inside the volume, which the
+      # rabbitmq user then can't read (EACCES) on every subsequent start. Setting the cookie
+      # explicitly sidesteps that file entirely. If you still hit
+      # "Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces" after this, the volume
+      # already has the bad file from a prior failed attempt — delete it with:
+      #   docker run --rm -v devops_rabbitmq-data:/var/lib/rabbitmq --entrypoint sh rabbitmq:3-management -c "rm -f /var/lib/rabbitmq/.erlang.cookie"
+      RABBITMQ_ERLANG_COOKIE: devops-project-cookie
+    ports:
+      - "5674:5672"
+      - "15674:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    image: devops-project/user-service:latest
+    container_name: user-service
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      JWT_SECRET: change-this-development-secret-key-to-something-long-and-random
+    ports:
+      - "9081:9081"
+    networks:
+      - devops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: catalog-service/Dockerfile
+    image: devops-project/catalog-service:latest
+    container_name: catalog-service
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+    ports:
+      - "9082:9082"
+    networks:
+      - devops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    image: devops-project/order-service:latest
+    container_name: order-service
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: guest
+      RABBITMQ_PASSWORD: guest
+      CATALOG_SERVICE_URL: http://catalog-service:9082
+    ports:
+      - "9083:9083"
+    networks:
+      - devops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    image: devops-project/notification-service:latest
+    container_name: notification-service
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: guest
+      RABBITMQ_PASSWORD: guest
+    ports:
+      - "9084:9084"
+    networks:
+      - devops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9084/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    image: devops-project/api-gateway:latest
+    container_name: api-gateway
+    environment:
+      USER_SERVICE_URL: http://user-service:9081
+      CATALOG_SERVICE_URL: http://catalog-service:9082
+      ORDER_SERVICE_URL: http://order-service:9083
+      NOTIFICATION_SERVICE_URL: http://notification-service:9084
+    ports:
+      - "9080:9080"
+    networks:
+      - devops-network
+    depends_on:
+      user-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s

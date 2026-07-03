@@ -1,8 +1,8 @@
 # devops-microservices
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
-multi-module project. REST communication, RabbitMQ messaging, and automated tests are all done
-(see Phase Plan below); no Docker packaging, CI/CD, or monitoring yet.
+multi-module project. REST communication, RabbitMQ messaging, automated tests, and Docker
+packaging are all done (see Phase Plan below); no CI/CD or monitoring yet.
 
 ## Architecture
 
@@ -219,32 +219,39 @@ If tests fail with this error on a different machine/setup, check `docker contex
 active endpoint and adjust `DOCKER_HOST` accordingly — the specific pipe name can differ by Docker
 Desktop version.
 
-## Build & run
+## Docker (phase 4 — done)
 
-Requires JDK 21 and Maven. Docker containers above must be running before starting any service
-that owns a database (all except api-gateway) or that touches RabbitMQ (order-service,
-notification-service).
+Every service has a multi-stage `Dockerfile` (Maven+JDK build stage → `eclipse-temurin:21-jre-alpine`
+runtime stage, non-root `spring` user, only the built jar copied in) and the whole stack runs via
+`docker-compose.yml` at the repo root: 5 app services + Postgres (one container, 4 databases via
+an init script) + RabbitMQ, on a dedicated bridge network, with health-check-gated startup
+ordering.
 
-Build everything from the root:
+**Two separate ways to run this project locally — don't mix them up:**
+
+| | Manual dev setup (phases 1-3) | Docker Compose (phase 4) |
+|---|---|---|
+| How | `mvn spring-boot:run` per service, `docker run` for Postgres/RabbitMQ | `docker compose up -d` |
+| Postgres | `devops-postgres` container, port **5433** | `compose-postgres`, port **5434** |
+| RabbitMQ | `devops-rabbitmq` container, ports **5673**/**15673** | `compose-rabbitmq`, ports **5674**/**15674** |
+| App services | your JVM processes, ports 9080-9084 | containers, **same** ports 9080-9084 |
+
+Infra ports are deliberately different so both setups can have their containers running at the
+same time without conflict. App service ports are the same in both because they represent "the
+same services" — don't run `mvn spring-boot:run` for a service at the same time as its
+Compose container, they'll fight over the port.
+
+### Build & run via Compose
+
+```bash
+docker compose build          # builds all 5 images (devops-project/<service>:latest)
+docker compose up -d          # starts everything, healthcheck-gated startup order
+docker compose ps             # check status — wait for all to show "healthy"
+docker compose logs -f order-service   # tail a specific service
+docker compose down           # stop everything (add -v to also wipe the postgres/rabbitmq volumes)
 ```
-mvn clean install
-```
 
-Run a single service (each is independently runnable):
-```
-cd user-service && mvn spring-boot:run
-cd catalog-service && mvn spring-boot:run
-cd order-service && mvn spring-boot:run
-cd notification-service && mvn spring-boot:run
-cd api-gateway && mvn spring-boot:run
-```
-
-Start order for a full local run: Postgres + RabbitMQ containers → catalog-service →
-notification-service → order-service → user-service → api-gateway (gateway last since it just
-routes to the others; order-service needs catalog-service up for its REST calls, and ideally
-notification-service up before you create an order so you can see the consumer fire immediately).
-
-Quick smoke test once everything is running (through the gateway on :9080):
+Smoke test once everything is healthy (same flow as the manual setup, same port 9080):
 ```bash
 curl -X POST http://localhost:9080/api/auth/register -H "Content-Type: application/json" \
   -d '{"username":"alice","email":"alice@example.com","password":"password123"}'
@@ -255,20 +262,53 @@ curl -X POST http://localhost:9080/api/books -H "Content-Type: application/json"
 curl -X POST http://localhost:9080/api/orders -H "Content-Type: application/json" \
   -d '{"bookId":1,"quantity":2,"buyerEmail":"alice@example.com"}'
 
-# Confirms the RabbitMQ round trip happened without checking logs:
-curl http://localhost:9080/api/notifications
-
-# Manual trigger still works independently of the order flow:
-curl -X POST http://localhost:9080/api/notifications/send -H "Content-Type: application/json" \
-  -d '{"recipient":"alice@example.com","message":"Your order shipped"}'
+curl http://localhost:9080/api/notifications   # should show the order confirmation
 ```
+Verified working end-to-end on 2026-07-03 entirely through the Compose stack.
 
-**Known gotcha fixed 2026-07-03**: the parent pom's `maven-compiler-plugin` now sets
-`<parameters>true</parameters>`. Without it, `@PathVariable Long id` (no explicit name) throws
-`IllegalArgumentException: Name for argument of type [java.lang.Long] not specified` at request
-time — compiles fine, only fails when the endpoint is actually hit. If you add new
-`@PathVariable`/`@RequestParam` args without an explicit name and see that error, check this flag
-survived any pom edits.
+### Externalized config
+
+Every value that used to be hardcoded to `localhost` is now `${ENV_VAR:default}` in
+`application.yml`, defaulting to the manual-dev-setup values so the *same jar* runs unmodified
+locally or in a container:
+
+| Env var | Used by | Local default | Compose value |
+|---|---|---|---|
+| `DB_HOST` / `DB_PORT` | user/catalog/order/notification | `localhost` / `5433` | `postgres` / `5432` |
+| `DB_USERNAME` / `DB_PASSWORD` | same 4 | `postgres` / `postgres` | same |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` | order, notification | `localhost` / `5673` | `rabbitmq` / `5672` |
+| `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` | order, notification | `guest` / `guest` | same |
+| `JWT_SECRET` / `JWT_EXPIRATION_MS` | user-service | dev placeholder secret | same (still a placeholder — see note below) |
+| `CATALOG_SERVICE_URL` | order-service | `http://localhost:9082` | `http://catalog-service:9082` |
+| `USER_SERVICE_URL` / `CATALOG_SERVICE_URL` / `ORDER_SERVICE_URL` / `NOTIFICATION_SERVICE_URL` | api-gateway (route targets) | `http://localhost:908x` | `http://<service-name>:908x` |
+
+**Not done**: real secret management. `JWT_SECRET` and DB/RabbitMQ credentials are still plaintext
+defaults/compose environment values, fine for a local university project but not something to
+carry into a real deployment — flagging in case a later phase (or grading rubric) expects
+Docker/Kubernetes secrets instead.
+
+### Three real bugs Compose caught that local dev hadn't
+
+1. **Executable jars weren't actually executable.** `spring-boot-maven-plugin` was declared in
+   every pom but never bound to the `repackage` goal (that binding normally comes for free from
+   `spring-boot-starter-parent`, which this project doesn't extend). `mvn package` was silently
+   producing a plain, non-runnable jar the whole time — invisible locally because
+   `mvn spring-boot:run` doesn't need the packaged jar at all, only surfaced once Docker tried
+   `java -jar app.jar` and got `no main manifest attribute`. Fixed by adding an `<executions>`
+   block binding `repackage` in the parent pom's `pluginManagement` (applies to all 5 modules).
+2. **user-service's `/actuator/health` returned 403.** Its Spring Security config only permits
+   `/api/auth/**`; everything else — including actuator — required a JWT. Fixed by adding
+   `/actuator/health` and `/actuator/health/**` to the permitted paths in `SecurityConfig`.
+3. **RabbitMQ container failing with `Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces`.**
+   A first-boot race in the official image's entrypoint (on this machine's Docker
+   Desktop/Windows/WSL2) can leave that file owned `root:root` mode `400`, unreadable by the
+   `rabbitmq` user on every subsequent start. Fixed by setting `RABBITMQ_ERLANG_COOKIE` explicitly
+   in compose (skips that file) — if you still hit this on a fresh volume, delete the stale file
+   per the comment in `docker-compose.yml`.
+
+Also tuned: healthcheck `start_period` for the Spring Boot services is `90s`, not the more typical
+`30s` — cold JVM boot under 5 containers starting/competing for CPU simultaneously was observed
+taking ~60s for a single service.
 
 ## Phase plan
 
@@ -279,11 +319,9 @@ survived any pom edits.
    JWT validation in order-service).
 3. **Tests** — done (2026-07-03). See "Tests" section above for the unit/integration split per
    service and the Windows Docker/Testcontainers gotcha.
-4. **Docker** *(next)* — Dockerfile per service, docker-compose for Postgres (+ per-service DBs)
-   and RabbitMQ, so the whole stack runs with one command instead of five terminal tabs plus two
-   `docker run`s. Also an opportunity to fold this project's Postgres/RabbitMQ containers and
-   port scheme into one `docker-compose.yml` instead of manual `docker run` commands.
-5. **CI/CD** — pipeline (GitHub Actions or similar) that builds all modules, runs tests, and
-   builds/pushes Docker images on merge.
-6. **Monitoring** — Spring Boot Actuator health/metrics endpoints, likely Prometheus + Grafana
-   for scraping/visualizing.
+4. **Docker** — done (2026-07-03). See "Docker" section above for the Dockerfile pattern, Compose
+   topology, port-mapping distinction from the manual dev setup, and the three real bugs it caught.
+5. **CI/CD** *(next)* — pipeline (GitHub Actions or similar) that builds all modules, runs tests,
+   and builds/pushes Docker images on merge.
+6. **Monitoring** — Spring Boot Actuator health/metrics endpoints (already added for health checks
+   in phase 4), likely Prometheus + Grafana for scraping/visualizing.

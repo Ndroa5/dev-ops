@@ -1,0 +1,10 @@
+**/target/
+**/.mvn/
+.git/
+.gitignore
+.idea/
+*.iml
+.vscode/
+.claude/
+*.md
+!CLAUDE.md
