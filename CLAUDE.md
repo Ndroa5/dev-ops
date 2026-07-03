@@ -1,8 +1,8 @@
 # devops-microservices
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
-multi-module project. REST communication and RabbitMQ messaging are both done (see Phase Plan
-below); no tests, Docker, CI/CD, or monitoring yet.
+multi-module project. REST communication, RabbitMQ messaging, and automated tests are all done
+(see Phase Plan below); no Docker packaging, CI/CD, or monitoring yet.
 
 ## Architecture
 
@@ -158,6 +158,67 @@ queue for failed message processing. `OrderEventListener` currently catches and 
 processing exception without rethrowing, so a bad message is acked and dropped rather than
 retried or dead-lettered. Revisit if a later phase needs delivery guarantees.
 
+## Tests (phase 3 — done)
+
+Each of the 4 business services (user/catalog/order/notification) has two layers of automated
+tests:
+
+- **Unit tests** (JUnit 5 + Mockito, `service/` package) — service-layer logic in isolation,
+  repositories/external clients mocked. No Spring context, no Docker, run in ~1s each.
+- **Integration tests** (`@SpringBootTest(webEnvironment = MOCK)` + `@AutoConfigureMockMvc` +
+  Testcontainers) — hit the real REST controllers backed by a real, throwaway Postgres container.
+  `webEnvironment = MOCK` means no real port is bound, so these never conflict with a
+  `mvn spring-boot:run` instance already listening on the service's real port.
+
+| Service | Unit test(s) | Integration test | What the integration test proves |
+|---|---|---|---|
+| user-service | `AuthServiceTest`, `JwtServiceTest` | `UserFlowIntegrationTest` | register → login → JWT issued → `GET /api/users/me` works with it; bad password and missing token are rejected |
+| catalog-service | `BookServiceTest` | `BookControllerIntegrationTest` | full CRUD lifecycle through the real controller, including the 409 on over-decrementing stock |
+| order-service | `OrderServiceTest` | `OrderControllerIntegrationTest` | order creation persists correctly and calls `RabbitTemplate.convertAndSend(...)` with the right exchange/routing-key/payload |
+| notification-service | `NotificationServiceTest` | `NotificationConsumerIntegrationTest` | a **real** message published to a **real** RabbitMQ testcontainer is picked up by `OrderEventListener` and lands as a `NotificationLog` row; manual `POST /api/notifications/send` still works too |
+
+**Why order-service mocks `RabbitTemplate` but notification-service uses a real RabbitMQ
+testcontainer**: order-service's integration test job is proving the *publish call* happens with
+the right payload (a mocked `RabbitTemplate` + `ArgumentCaptor` is enough, and skips needing a
+broker). notification-service's job is proving the *actual consume* works — that only means
+something if a real message crosses a real broker into a real `@RabbitListener`. Splitting it this
+way instead of standing up RabbitMQ in both avoids double-testing the same transport while still
+covering both ends of the pipe.
+
+Run everything:
+```
+mvn clean install
+```
+Run a single module's tests:
+```
+mvn -pl user-service test
+```
+Testcontainers spins up its own Postgres (and, for notification-service, RabbitMQ) containers per
+test class — **the services you run locally via `mvn spring-boot:run` do not need to be running**
+for tests to pass, and the reverse is also true (tests don't touch your dev Postgres/RabbitMQ
+containers at all, they get their own ephemeral ones).
+
+**Requires Docker to be running** — Testcontainers needs a working Docker daemon to start its
+throwaway containers.
+
+**Windows-specific gotcha hit on this machine (2026-07-03), only relevant if `mvn test` fails
+immediately with `IllegalStateException: Could not find a valid Docker environment`**: this
+machine's Docker Desktop (4.69.0 / Engine 29.4.0) doesn't work with Testcontainers' default
+Windows named-pipe auto-detection here — it connects, but gets a stubbed/rejected response instead
+of real daemon info. Two things fixed it:
+1. Set `DOCKER_HOST=npipe:////./pipe/docker_engine_linux` in the shell before running Maven (the
+   default-detected pipe, `docker_cli`, doesn't behave the same as this one — if `docker info`
+   works fine from your terminal but Testcontainers still can't find Docker, try this).
+2. The parent pom's `maven-surefire-plugin` now sets `-Dapi.version=1.44` via `argLine` — without
+   it, docker-java's own default (API 1.32) gets rejected by this Engine build with
+   `client version 1.32 is too old. Minimum supported API version is 1.40`. This is baked into the
+   pom (harmless on older Docker installs too), so only the `DOCKER_HOST` env var should ever need
+   setting by hand.
+
+If tests fail with this error on a different machine/setup, check `docker context ls` for the
+active endpoint and adjust `DOCKER_HOST` accordingly — the specific pipe name can differ by Docker
+Desktop version.
+
 ## Build & run
 
 Requires JDK 21 and Maven. Docker containers above must be running before starting any service
@@ -216,11 +277,10 @@ survived any pom edits.
 2. **RabbitMQ** — done (2026-07-03). See "RabbitMQ messaging" section above for exchange/queue
    names, payload shape, and the buyer-identity scope decision (client-supplied `buyerEmail`, no
    JWT validation in order-service).
-3. **Tests** *(next)* — unit tests per service (service-layer logic, controller slice tests),
-   integration tests for the order-service → catalog-service REST call and the RabbitMQ
-   publish/consume flow.
-4. **Docker** — Dockerfile per service, docker-compose for Postgres (+ per-service DBs) and
-   RabbitMQ, so the whole stack runs with one command instead of five terminal tabs plus two
+3. **Tests** — done (2026-07-03). See "Tests" section above for the unit/integration split per
+   service and the Windows Docker/Testcontainers gotcha.
+4. **Docker** *(next)* — Dockerfile per service, docker-compose for Postgres (+ per-service DBs)
+   and RabbitMQ, so the whole stack runs with one command instead of five terminal tabs plus two
    `docker run`s. Also an opportunity to fold this project's Postgres/RabbitMQ containers and
    port scheme into one `docker-compose.yml` instead of manual `docker run` commands.
 5. **CI/CD** — pipeline (GitHub Actions or similar) that builds all modules, runs tests, and
