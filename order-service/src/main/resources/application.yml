@@ -1,0 +1,24 @@
+server:
+  port: 9083
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/orderdb
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+catalog-service:
+  url: http://localhost:9082
+
+logging:
+  level:
+    com.university.orderservice: DEBUG

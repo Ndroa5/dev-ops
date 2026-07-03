@@ -1,0 +1,10 @@
+target/
+*.class
+
+.idea/
+*.iml
+.vscode/
+.claude/
+
+*.log
+.DS_Store
