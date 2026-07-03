@@ -1,8 +1,8 @@
 # devops-microservices
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
-multi-module project. REST communication, RabbitMQ messaging, automated tests, and Docker
-packaging are all done (see Phase Plan below); no CI/CD or monitoring yet.
+multi-module project. REST communication, RabbitMQ messaging, automated tests, Docker packaging,
+and CI are all done (see Phase Plan below); no CD or monitoring yet.
 
 ## Architecture
 
@@ -310,6 +310,52 @@ Also tuned: healthcheck `start_period` for the Spring Boot services is `90s`, no
 `30s` — cold JVM boot under 5 containers starting/competing for CPU simultaneously was observed
 taking ~60s for a single service.
 
+## CI (phase 5 — done)
+
+`.github/workflows/ci.yml` — two jobs:
+
+1. **`build-and-test`** — checks out the repo, sets up JDK 21 (Temurin), caches `~/.m2` via
+   `actions/setup-java`'s built-in maven cache, then runs `mvn --batch-mode clean install` for
+   the whole multi-module reactor (build + all unit and integration tests). A test failure fails
+   the job, which blocks `docker-build` from running. Uploads every service's built jar
+   (`*/target/*.jar`) as a workflow artifact (`service-jars`, 7-day retention) so they're
+   downloadable without re-running the build — `if: always()` so jars from a partially-successful
+   build are still uploaded for inspection even if a later module failed.
+2. **`docker-build`** — matrix over all 5 services, `needs: build-and-test` (only runs if tests
+   passed). Runs `docker build -f <service>/Dockerfile -t devops-project/<service>:ci .` for each,
+   confirming every Dockerfile still builds cleanly. **Build only, no push** — pushing to a
+   registry is the CD phase, not this one.
+
+**Triggers**: every push to any branch, and every pull request targeting `main`. This means a
+feature branch gets CI feedback on every push (not just when a PR is opened), and a PR gets a
+second, identical run against the merge commit.
+
+**Testcontainers on GitHub-hosted runners just works, no workaround needed**: ubuntu-latest
+runners ship Docker preinstalled and reachable on the standard unix socket, so Testcontainers'
+default auto-detection finds it with no `DOCKER_HOST` override — unlike the Windows/Docker
+Desktop pipe workaround documented in the Tests section above, which is purely a local-dev-machine
+quirk and isn't referenced anywhere in committed config (the surefire `-Dapi.version=1.44` argLine
+is harmless/generic and works fine on Linux too, since it just forces a modern API version
+request that any reasonably current Docker Engine accepts).
+
+## Git workflow (going forward)
+
+Starting from the CI phase: **feature branch → pull request into `main` → CI runs automatically →
+merge once green.** Don't commit directly to `main`.
+
+```bash
+git checkout main && git pull
+git checkout -b feature/my-change
+# ... commit work ...
+git push -u origin feature/my-change
+gh pr create --base main   # or open the PR on github.com
+```
+CI runs on the branch push and again on the PR. Once `build-and-test` and all 5 `docker-build`
+matrix jobs are green, merge the PR (don't force-merge on a red pipeline).
+
+Phases 1-4 (scaffold through Docker) were committed straight to `main` as the initial baseline
+before this workflow started — see the phase plan below for what each of those commits covers.
+
 ## Phase plan
 
 1. **REST communication** — done. Services scaffolded, order-service ↔ catalog-service wired via
@@ -321,7 +367,7 @@ taking ~60s for a single service.
    service and the Windows Docker/Testcontainers gotcha.
 4. **Docker** — done (2026-07-03). See "Docker" section above for the Dockerfile pattern, Compose
    topology, port-mapping distinction from the manual dev setup, and the three real bugs it caught.
-5. **CI/CD** *(next)* — pipeline (GitHub Actions or similar) that builds all modules, runs tests,
-   and builds/pushes Docker images on merge.
+5. **CI/CD** — CI half done (2026-07-03): see "CI" section above for the workflow's triggers and
+   jobs. CD (pushing images to a registry and/or auto-deploying) *(next)*.
 6. **Monitoring** — Spring Boot Actuator health/metrics endpoints (already added for health checks
    in phase 4), likely Prometheus + Grafana for scraping/visualizing.
