@@ -20,6 +20,12 @@ spring:
     port: ${RABBITMQ_PORT:5673}
     username: ${RABBITMQ_USERNAME:guest}
     password: ${RABBITMQ_PASSWORD:guest}
+    template:
+      # Spring AMQP does not enable Micrometer observation (and therefore trace propagation
+      # through message headers) by default - this has to be turned on explicitly. See
+      # notification-service's spring.rabbitmq.listener.simple.observation-enabled for the
+      # consumer-side counterpart.
+      observation-enabled: true
 
 catalog-service:
   url: ${CATALOG_SERVICE_URL:http://localhost:9082}
@@ -33,7 +39,19 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
 
 logging:
   level:
