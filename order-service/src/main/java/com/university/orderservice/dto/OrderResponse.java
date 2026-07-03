@@ -9,6 +9,7 @@ public record OrderResponse(
         Long id,
         Long bookId,
         Integer quantity,
+        String buyerEmail,
         BigDecimal totalPrice,
         OrderStatus status,
         Instant createdAt

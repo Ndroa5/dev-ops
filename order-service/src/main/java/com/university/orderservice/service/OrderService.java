@@ -37,13 +37,15 @@ public class OrderService {
         Order order = Order.builder()
                 .bookId(request.bookId())
                 .quantity(request.quantity())
+                .buyerEmail(request.buyerEmail())
                 .totalPrice(totalPrice)
                 .status(OrderStatus.CONFIRMED)
                 .build();
         order = orderRepository.save(order);
 
         orderEventPublisher.publishOrderCreated(new OrderCreatedEvent(
-                order.getId(), order.getBookId(), order.getQuantity(), order.getTotalPrice(), order.getCreatedAt()
+                order.getId(), order.getBookId(), order.getQuantity(), order.getBuyerEmail(),
+                order.getTotalPrice(), order.getCreatedAt()
         ));
 
         return toResponse(order);
@@ -61,7 +63,7 @@ public class OrderService {
 
     private OrderResponse toResponse(Order order) {
         return new OrderResponse(
-                order.getId(), order.getBookId(), order.getQuantity(),
+                order.getId(), order.getBookId(), order.getQuantity(), order.getBuyerEmail(),
                 order.getTotalPrice(), order.getStatus(), order.getCreatedAt()
         );
     }

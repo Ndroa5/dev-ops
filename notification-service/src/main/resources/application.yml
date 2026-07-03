@@ -15,6 +15,17 @@ spring:
     properties:
       hibernate:
         format_sql: true
+  rabbitmq:
+    host: localhost
+    port: 5673
+    username: guest
+    password: guest
+
+app:
+  rabbitmq:
+    exchange: order-events-exchange
+    routing-key: order.created
+    queue: notification.order-created-queue
 
 logging:
   level:

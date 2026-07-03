@@ -30,6 +30,9 @@ public class Order {
     private Integer quantity;
 
     @Column(nullable = false)
+    private String buyerEmail;
+
+    @Column(nullable = false)
     private BigDecimal totalPrice;
 
     @Enumerated(EnumType.STRING)
