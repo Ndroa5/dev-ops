@@ -2,7 +2,7 @@
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
 multi-module project. REST communication, RabbitMQ messaging, automated tests, Docker packaging,
-and CI/CD are all done (see Phase Plan below); no monitoring yet.
+CI/CD, and monitoring (logs, metrics, and traces) are all done — every phase in the spec.
 
 ## Architecture
 
@@ -398,6 +398,124 @@ gets deployed to — "deploy" here means "publish images + prove the stack start
 healthy," not deploying to any real infrastructure. Flagging in case that's expected for a later
 phase or the grading rubric.
 
+## Monitoring (phase 6 — done): logs, metrics, and traces
+
+The spec requires all three pillars, not just metrics — this section maps directly to that
+requirement for the defense: **metrics** (Micrometer → Prometheus → Grafana), **traces**
+(Micrometer Tracing/Brave → Zipkin), **logs** (container stdout → Promtail → Loki → Grafana).
+Everything here lives only in `docker-compose.yml` (local dev stack) — deliberately **not** in
+`docker-compose.prod.yml`.
+
+### Access
+
+| Tool | URL | Credentials |
+|---|---|---|
+| Grafana | http://localhost:3001 | admin / admin |
+| Prometheus | http://localhost:9091 | none |
+| Zipkin | http://localhost:9412 | none |
+| Loki | http://localhost:3100 (API only, no UI — use Grafana) | none |
+
+Ports are shifted from each tool's usual default (Grafana 3000→3001, Prometheus 9090→9091, Zipkin
+9411→9412) because this machine's unrelated "cinebook" stack already occupies the defaults — see
+the port-collision note earlier in this file. Loki's port (3100) wasn't contested, so it kept its
+default.
+
+### Metrics — Micrometer → Prometheus → Grafana
+
+All 5 services depend on `micrometer-registry-prometheus` and expose `/actuator/prometheus`
+(`management.endpoints.web.exposure.include: health,prometheus` — user-service's `SecurityConfig`
+additionally permits `/actuator/prometheus` without a JWT, same reasoning as the `/actuator/health`
+permit from the Docker phase). Every service also sets `management.metrics.tags.application:
+${spring.application.name}`, so Prometheus/Grafana queries can group by service.
+
+Prometheus (`docker/prometheus/prometheus.yml`) scrapes all 5 on a 10s interval via their
+container DNS names. Grafana is provisioned (not clicked together) with Prometheus as a datasource
+and a dashboard, **DevOps Microservices Overview**, showing:
+- **Request rate per service** — `sum by (application) (rate(http_server_requests_seconds_count[1m]))`
+- **Error rate (4xx/5xx) per service** — same, filtered to `status=~"4..|5.."`
+- **p50/p95 latency per service** — `histogram_quantile(...)` over `http_server_requests_seconds_bucket`
+  (needs `management.metrics.distribution.percentiles-histogram.http.server.requests: true`, set on
+  every service)
+
+**Known scope limit**: api-gateway is Spring Cloud Gateway (WebFlux), and its *proxied* routes
+don't produce `http_server_requests_seconds` — that metric only covers its own `/actuator/**` and
+`/gateway/status` endpoints. Proxied-route timing lives under a different metric name,
+`spring_cloud_gateway_requests_seconds`. The dashboard as built covers the 4 business services'
+real MVC traffic correctly; extending it to gateway-specific proxied-route metrics would need its
+own panel using that metric name — flagging as a known gap rather than silently mismatching what
+"per service" shows for the gateway.
+
+### Traces — Micrometer Tracing (Brave) → Zipkin
+
+All 5 services depend on `micrometer-tracing-bridge-brave` + `zipkin-reporter-brave`,
+`management.tracing.sampling.probability: 1.0` (100% — fine for a university project, would never
+do this in production), and `management.zipkin.tracing.endpoint` pointing at the `zipkin`
+container.
+
+**The RabbitMQ trace-propagation question (this needed real investigation, not a guess)**: Spring
+AMQP does **not** enable Micrometer observation by default on either `RabbitTemplate` or
+`@RabbitListener` containers — confirmed against Spring AMQP's own reference docs and a
+still-open spring-projects/spring-amqp issue ("observationEnabled currently defaults to false").
+Without enabling it explicitly, order-service's publish and notification-service's consume would
+each start their own disconnected trace instead of one continuing the other. Fixed with two
+properties:
+```yaml
+# order-service (producer)
+spring.rabbitmq.template.observation-enabled: true
+# notification-service (consumer)
+spring.rabbitmq.listener.simple.observation-enabled: true
+```
+Once both are set, trace context propagates through the message headers automatically — no extra
+beans needed, Micrometer Tracing's Brave propagator handles it.
+
+**A second, related bug found and fixed while verifying this**: order-service's `RestClient` bean
+(used to call catalog-service) was built via the static `RestClient.builder()` factory method
+instead of injecting Spring Boot's auto-configured `RestClient.Builder` bean — the auto-configured
+builder is what Spring Boot wires observation/tracing instrumentation onto, so the static factory
+call meant calls to catalog-service carried no trace context and never joined the caller's trace
+at all (confirmed missing from Zipkin before the fix). Switching to the injected builder fixed
+that, but surfaced a **third**, well-known gotcha: Spring Boot's auto-configured builder defaults
+to `SimpleClientHttpRequestFactory` (`java.net.HttpURLConnection`), which cannot send PATCH
+requests (`ProtocolException: Invalid HTTP method: PATCH`) — and order-service's stock-decrement
+call is a PATCH. Fixed by explicitly setting `.requestFactory(new JdkClientHttpRequestFactory())`
+on the builder in `RestClientConfig`, which keeps the tracing instrumentation from the injected
+builder while actually supporting PATCH. See the comments in `order-service/.../RestClientConfig.java`.
+
+**Verified end-to-end on 2026-07-03**: a single `POST /api/orders` through the gateway produced
+one 9-span trace in Zipkin, all sharing one trace ID: api-gateway → order-service →
+(catalog-service GET, catalog-service PATCH) → order-service → RabbitMQ → notification-service.
+Every hop — sync HTTP and async messaging — correctly joined the same trace.
+
+Zipkin is also added as a Grafana datasource (`type: zipkin`, Grafana's built-in core plugin,
+Grafana ≥ 12.3.0) so metrics, traces, and logs are all reachable from one Grafana instance even
+though traces aren't on the dashboard itself — Zipkin's own UI (http://localhost:9412) is the
+better place to explore a specific trace's waterfall view.
+
+### Logs — Promtail → Loki → Grafana
+
+Promtail discovers containers via `docker_sd_configs` against the Docker socket, **filtered to
+only containers labeled `devops.logging=true`** (set on all 5 app services in
+`docker-compose.yml`) — this machine runs other unrelated Docker projects side by side, and
+without this filter Promtail would ship every container's logs on the host into this stack's
+Loki, not just ours. Each service also gets a `devops.service` label, relabeled into a
+`service_name` Loki label for filtering.
+
+Chose Promtail (a container in the compose stack) over the Docker Loki logging driver
+specifically because the logging driver requires a one-time `docker plugin install` on the host
+*outside* of docker-compose — Promtail is fully self-contained within `docker-compose.yml`, matching
+this phase's "everything in docker-compose.yml" constraint.
+
+The Grafana dashboard's **Logs** panel queries `{service_name=~"$service"}`, where `$service` is a
+dashboard template variable populated from Loki's own label values (defaults to "All" via a
+multi-select) — this is the "search/filter logs by service name" requirement. Query Loki directly
+too if useful: `curl http://localhost:3100/loki/api/v1/label/service_name/values`.
+
+**Verified end-to-end on 2026-07-03**: queried Loki directly for `{service_name="order-service"}`
+and `{service_name="notification-service"}` after generating traffic — both returned real log
+lines, including Spring Boot's default logging pattern's embedded `[traceId-spanId]` (a nice bonus:
+trace ↔ log correlation works for free once tracing is wired up, since Micrometer Tracing adds
+that to the MDC/log pattern automatically).
+
 ## Git workflow (going forward)
 
 Starting from the CI phase: **feature branch → pull request into `main` → CI runs automatically →
@@ -430,5 +548,8 @@ before this workflow started — see the phase plan below for what each of those
 5. **CI/CD** — done (2026-07-03). See "CI" and "CD" sections above — CI builds/tests/build-only
    Docker images on every push and PR; CD publishes tagged images to Docker Hub and runs a
    post-deploy health check, triggered only on an actual merge into `main`.
-6. **Monitoring** *(next)* — Spring Boot Actuator health/metrics endpoints (already added for
-   health checks in phase 4), likely Prometheus + Grafana for scraping/visualizing.
+6. **Monitoring** — done (2026-07-03). See "Monitoring" section above — logs (Promtail/Loki),
+   metrics (Prometheus/Grafana), and traces (Zipkin) all wired up and verified end-to-end,
+   including two real bugs found while confirming trace propagation (RabbitMQ observation not
+   enabled by default, and a PATCH-breaking RestClient request factory regression). This was the
+   last phase in the spec.

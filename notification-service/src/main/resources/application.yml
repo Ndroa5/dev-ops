@@ -20,6 +20,12 @@ spring:
     port: ${RABBITMQ_PORT:5673}
     username: ${RABBITMQ_USERNAME:guest}
     password: ${RABBITMQ_PASSWORD:guest}
+    listener:
+      simple:
+        # Consumer-side counterpart of order-service's spring.rabbitmq.template.observation-enabled
+        # - without this, the trace context carried in the message headers is never read back out,
+        # so the listener's span would start a brand new trace instead of continuing the caller's.
+        observation-enabled: true
 
 app:
   rabbitmq:
@@ -31,7 +37,19 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
 
 logging:
   level:
