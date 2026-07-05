@@ -13,6 +13,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # SonarCloud needs full history (not the default shallow clone) for accurate blame /
+          # new-code-period analysis.
+          fetch-depth: 0
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -20,6 +24,13 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
 
       # GitHub-hosted ubuntu runners ship Docker preinstalled and reachable on the standard
       # unix socket, so Testcontainers auto-detects it with no DOCKER_HOST override needed here
@@ -40,6 +51,14 @@ jobs:
             notification-service/target/*.jar
           retention-days: 7
           if-no-files-found: error
+
+      # Runs once at the reactor root, after the build above - the sonar-maven-plugin walks all
+      # 5 modules automatically (standard Maven multi-module layout, no per-module config needed)
+      # and aggregates them into one SonarCloud project.
+      - name: SonarCloud static analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn --batch-mode org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.projectKey=Ndroa5_dev-ops
 
   docker-build:
     name: Build Docker image (${{ matrix.service }})

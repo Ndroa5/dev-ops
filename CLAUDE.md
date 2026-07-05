@@ -2,7 +2,8 @@
 
 University DevOps project: a 5-service Spring Boot microservices architecture, built as a Maven
 multi-module project. REST communication, RabbitMQ messaging, automated tests, Docker packaging,
-CI/CD, and monitoring (logs, metrics, and traces) are all done — every phase in the spec.
+CI/CD, monitoring (logs, metrics, and traces), and static analysis (SonarCloud) are all done —
+every phase in the spec.
 
 ## Architecture
 
@@ -516,6 +517,40 @@ lines, including Spring Boot's default logging pattern's embedded `[traceId-span
 trace ↔ log correlation works for free once tracing is wired up, since Micrometer Tracing adds
 that to the MDC/log pattern automatically).
 
+## Static analysis (SonarCloud — done)
+
+Satisfies the spec's "static analysis integrated into CI" requirement. Runs as an extra step in
+the **existing** `build-and-test` job in `.github/workflows/ci.yml` — no separate workflow file,
+since it needs the same `mvn clean install` that job already does (compiled classes, not just
+source, are required for accurate analysis) and duplicating that build for its own workflow would
+just double the CI time for no benefit.
+
+**View results**: https://sonarcloud.io/project/overview?id=Ndroa5_dev-ops (organization `ndroa5`,
+project key `Ndroa5_dev-ops`).
+
+**How it's wired in**:
+- Parent `pom.xml` sets `<sonar.organization>ndroa5</sonar.organization>` in `<properties>`.
+- After the existing "Build and test all modules" step, a new step runs
+  `mvn --batch-mode org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+  -Dsonar.projectKey=Ndroa5_dev-ops`, authenticated via the `SONAR_TOKEN` repo secret (env var,
+  not a CLI arg — keeps it out of process listings/logs).
+- `~/.sonar/cache` is cached the same way `actions/setup-java` already caches `~/.m2` (a
+  dedicated `actions/cache@v4` step, since `setup-java`'s built-in cache only covers the Maven
+  local repo).
+- The checkout step for this job now uses `fetch-depth: 0` (full git history, not the default
+  shallow clone) — SonarCloud needs this for accurate blame / new-code-period analysis, not
+  something that mattered before Sonar was in the picture.
+
+**Multi-module aggregation — no extra per-module config needed**: running `sonar:sonar` once at
+the reactor root, after the whole reactor is built, is the standard supported way to analyze a
+Maven multi-module project — the plugin walks the parent's `<modules>` list automatically and
+aggregates all 5 services into one SonarCloud project. This "just works" here specifically because
+every module follows the standard Maven layout (`src/main/java`, `src/test/java`) with nothing
+unusual to point Sonar at — no per-module `sonar.sources`/`sonar.tests` overrides were needed.
+
+**Verified 2026-07-05**: confirmed via the SonarCloud API (not just that the CI job went green)
+that an analysis actually landed for this project, covering all 5 modules.
+
 ## Git workflow (going forward)
 
 Starting from the CI phase: **feature branch → pull request into `main` → CI runs automatically →
@@ -551,5 +586,7 @@ before this workflow started — see the phase plan below for what each of those
 6. **Monitoring** — done (2026-07-03). See "Monitoring" section above — logs (Promtail/Loki),
    metrics (Prometheus/Grafana), and traces (Zipkin) all wired up and verified end-to-end,
    including two real bugs found while confirming trace propagation (RabbitMQ observation not
-   enabled by default, and a PATCH-breaking RestClient request factory regression). This was the
-   last phase in the spec.
+   enabled by default, and a PATCH-breaking RestClient request factory regression).
+7. **Static analysis** — done (2026-07-05). See "Static analysis" section above — SonarCloud
+   analysis runs as part of the existing CI `build-and-test` job, aggregating all 5 modules into
+   one project. This was the last phase in the spec.
