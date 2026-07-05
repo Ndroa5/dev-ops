@@ -5,6 +5,9 @@ networks:
 volumes:
   postgres-data:
   rabbitmq-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
 
 services:
   postgres:
@@ -59,12 +62,16 @@ services:
       dockerfile: user-service/Dockerfile
     image: devops-project/user-service:latest
     container_name: user-service
+    labels:
+      devops.logging: "true"
+      devops.service: "user-service"
     environment:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_USERNAME: postgres
       DB_PASSWORD: postgres
       JWT_SECRET: change-this-development-secret-key-to-something-long-and-random
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "9081:9081"
     networks:
@@ -85,11 +92,15 @@ services:
       dockerfile: catalog-service/Dockerfile
     image: devops-project/catalog-service:latest
     container_name: catalog-service
+    labels:
+      devops.logging: "true"
+      devops.service: "catalog-service"
     environment:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_USERNAME: postgres
       DB_PASSWORD: postgres
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "9082:9082"
     networks:
@@ -110,6 +121,9 @@ services:
       dockerfile: order-service/Dockerfile
     image: devops-project/order-service:latest
     container_name: order-service
+    labels:
+      devops.logging: "true"
+      devops.service: "order-service"
     environment:
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -120,6 +134,7 @@ services:
       RABBITMQ_USERNAME: guest
       RABBITMQ_PASSWORD: guest
       CATALOG_SERVICE_URL: http://catalog-service:9082
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "9083:9083"
     networks:
@@ -144,6 +159,9 @@ services:
       dockerfile: notification-service/Dockerfile
     image: devops-project/notification-service:latest
     container_name: notification-service
+    labels:
+      devops.logging: "true"
+      devops.service: "notification-service"
     environment:
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -153,6 +171,7 @@ services:
       RABBITMQ_PORT: "5672"
       RABBITMQ_USERNAME: guest
       RABBITMQ_PASSWORD: guest
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "9084:9084"
     networks:
@@ -175,11 +194,15 @@ services:
       dockerfile: api-gateway/Dockerfile
     image: devops-project/api-gateway:latest
     container_name: api-gateway
+    labels:
+      devops.logging: "true"
+      devops.service: "api-gateway"
     environment:
       USER_SERVICE_URL: http://user-service:9081
       CATALOG_SERVICE_URL: http://catalog-service:9082
       ORDER_SERVICE_URL: http://order-service:9083
       NOTIFICATION_SERVICE_URL: http://notification-service:9084
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "9080:9080"
     networks:
@@ -199,3 +222,100 @@ services:
       timeout: 5s
       retries: 10
       start_period: 90s
+
+  # ---------------------------------------------------------------------------------------------
+  # Observability stack (monitoring phase) - metrics (Prometheus/Grafana), traces (Zipkin), and
+  # logs (Loki/Promtail). Local dev only - deliberately not part of docker-compose.prod.yml.
+  # ---------------------------------------------------------------------------------------------
+
+  zipkin:
+    image: openzipkin/zipkin:latest
+    container_name: zipkin
+    ports:
+      - "9412:9411"
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9411/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./docker/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - devops-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./docker/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - devops-network
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - devops-network
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      zipkin:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
