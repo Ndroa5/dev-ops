@@ -220,6 +220,49 @@ If tests fail with this error on a different machine/setup, check `docker contex
 active endpoint and adjust `DOCKER_HOST` accordingly — the specific pipe name can differ by Docker
 Desktop version.
 
+### End-to-end test (`e2e-tests` module)
+
+The unit/integration tests above each cover **one service in isolation** (integration tests use a
+real Postgres/RabbitMQ Testcontainer, but drive the service's own controller directly via MockMvc
+— they never make a real HTTP call to another live service). There was no automated test proving
+the **whole chain** works together across independently running containers, only a one-off manual
+`curl` walkthrough documented in this file. Added a 6th Maven module, `e2e-tests`, specifically to
+close that gap:
+
+- **`e2e-tests/docker-compose.e2e.yml`** — a dedicated compose file (all 5 services + Postgres +
+  RabbitMQ, no observability stack) on its own port range (services **9180-9184**, Postgres
+  **5436**, RabbitMQ **5676**/**15676**) so it never collides with the manual dev setup, the
+  regular `docker-compose.yml` dev stack, or `docker-compose.prod.yml` — all of which can be
+  running at the same time. No `container_name` is set on any service, so Testcontainers can
+  freely assign unique per-run container names instead of colliding with the dev stack's fixed
+  ones (e.g. plain `user-service`).
+- **`FullOrderFlowE2ETest`** — brings that compose file up via Testcontainers'
+  `ComposeContainer`, waits for `api-gateway`'s Docker healthcheck, then drives the real flow over
+  plain HTTP through the gateway: register → create book → create order → assert stock decremented
+  on catalog-service → poll `/api/notifications` (RabbitMQ + RxJava are async, so this uses
+  Awaitility) until the confirmation lands. This is the one test that proves REST, RabbitMQ, and
+  the RxJava pipeline all actually work together end-to-end, not just within a single service's
+  Spring context.
+- Runs automatically as part of `mvn clean install` like every other module's tests — no separate
+  CI wiring needed, since it's just another module in the reactor.
+
+**Every one of the 5 Dockerfiles needed a one-line fix for this to build at all**: each Dockerfile
+copies only the specific sibling `pom.xml` files it needs (for Docker layer caching), and Maven
+validates the *entire* module list declared in the parent `pom.xml` before honoring `-pl <service>
+-am`, even though the build only targets one module. Adding `e2e-tests` to the parent's
+`<modules>` without also adding `COPY e2e-tests/pom.xml e2e-tests/pom.xml` to all 5 Dockerfiles
+broke every single service image build (`Child module /build/e2e-tests of /build/pom.xml does not
+exist`). Fixed by adding that one COPY line to each Dockerfile, mirroring the existing pattern
+where every Dockerfile already lists all of its siblings' poms for exactly this reason.
+
+**Healthcheck margins were widened for this compose file specifically** (`retries: 20` instead of
+the usual `10` on all 5 app services, ~290s max instead of ~190s): a first attempt at running this
+test *while the regular dev `docker-compose.yml` stack (12 containers) was also running* caused
+`order-service` to blow past the original budget under real resource contention and get killed as
+unhealthy, even though the same compose file came up perfectly healthy standalone. Since this test
+needs to pass reliably on shared/variable-load CI runners too, not just an idle dev machine, the
+margin was widened rather than just re-running on a quieter machine.
+
 ## Docker (phase 4 — done)
 
 Every service has a multi-stage `Dockerfile` (Maven+JDK build stage → `eclipse-temurin:21-jre-alpine`
@@ -326,6 +369,16 @@ taking ~60s for a single service.
    passed). Runs `docker build -f <service>/Dockerfile -t devops-project/<service>:ci .` for each,
    confirming every Dockerfile still builds cleanly. **Build only, no push** — pushing to a
    registry is the CD phase, not this one.
+
+**`build-and-test` now also builds all 5 Docker images a second time, via the `e2e-tests` module**:
+since `mvn clean install` runs every module's tests including `FullOrderFlowE2ETest`, which brings
+up `docker-compose.e2e.yml` (all 5 services built from their Dockerfiles) as part of the test
+itself, `build-and-test` ends up building every image once here *and* again in the separate
+`docker-build` job below. This is deliberate duplication, not an oversight — `docker-build`'s job is
+proving the committed Dockerfiles build cleanly in isolation (its whole purpose), while
+`e2e-tests`'s build is just a side effect of needing real containers to test against. Removing
+either would either lose Dockerfile-build verification or lose the end-to-end test; adds a few
+extra minutes to `build-and-test` but was judged worth it for genuine cross-service test coverage.
 
 **Triggers**: every push to any branch, and every pull request targeting `main`. This means a
 feature branch gets CI feedback on every push (not just when a PR is opened), and a PR gets a
@@ -576,8 +629,10 @@ before this workflow started — see the phase plan below for what each of those
 2. **RabbitMQ** — done (2026-07-03). See "RabbitMQ messaging" section above for exchange/queue
    names, payload shape, and the buyer-identity scope decision (client-supplied `buyerEmail`, no
    JWT validation in order-service).
-3. **Tests** — done (2026-07-03). See "Tests" section above for the unit/integration split per
-   service and the Windows Docker/Testcontainers gotcha.
+3. **Tests** — done (2026-07-03), extended (2026-07-06). See "Tests" section above for the
+   unit/integration split per service, the Windows Docker/Testcontainers gotcha, and the later
+   addition of a real cross-service end-to-end test (`e2e-tests` module) that drives the whole
+   order flow through live containers rather than a single service's Spring context.
 4. **Docker** — done (2026-07-03). See "Docker" section above for the Dockerfile pattern, Compose
    topology, port-mapping distinction from the manual dev setup, and the three real bugs it caught.
 5. **CI/CD** — done (2026-07-03). See "CI" and "CD" sections above — CI builds/tests/build-only

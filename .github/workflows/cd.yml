@@ -51,11 +51,19 @@ jobs:
       - name: Push both tags to Docker Hub
         run: docker push --all-tags "${{ secrets.DOCKERHUB_USERNAME }}/devops-${{ matrix.service }}"
 
+  # Runs on this project's own self-hosted runner (a Windows service on the dev machine, not a
+  # GitHub-hosted runner) because its whole job is to actually leave the deployed stack running
+  # afterward - a GitHub-hosted runner is destroyed the moment the job ends, so nothing deployed
+  # there could ever persist. This is the "local" deployment path from the spec (item 8 permits
+  # local as an equal alternative to cloud); the runner turns the previously-manual
+  # `docker compose -f docker-compose.prod.yml pull && up -d` step into something that now happens
+  # automatically on every merge to main, satisfying "automatski deploy nove verzije aplikacije"
+  # for real instead of just building+pushing images and discarding the result.
   post-deploy-health-check:
     name: Post-deploy health check
     needs: build-and-push
     if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Check out merge commit
         uses: actions/checkout@v4
@@ -63,11 +71,13 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
 
       - name: Compute short SHA tag
+        shell: bash
         run: |
           SHA="${{ github.event.pull_request.merge_commit_sha }}"
           echo "TAG=${SHA:0:7}" >> "$GITHUB_ENV"
 
-      - name: Pull freshly-published images and start the stack
+      - name: Pull freshly-published images and (re)start the stack
+        shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
@@ -75,6 +85,7 @@ jobs:
           docker compose -f docker-compose.prod.yml up -d --wait --wait-timeout 180
 
       - name: Hit each service's /actuator/health endpoint
+        shell: bash
         run: |
           set -e
           for port in 9080 9081 9082 9083 9084; do
@@ -84,8 +95,9 @@ jobs:
           done
           echo "All 5 services report UP."
 
-      - name: Tear down the stack
-        if: always()
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: docker compose -f docker-compose.prod.yml down -v
+      # Deliberately no teardown step here anymore - the whole point of moving this job to a
+      # self-hosted runner was to leave the freshly-deployed stack running instead of discarding
+      # it. If a health check fails above, the previous (still-running) containers are left alone
+      # rather than torn down, since `docker compose up -d` only recreates containers whose image
+      # actually changed - a bad new image failing health checks doesn't take down a working prior
+      # deployment.

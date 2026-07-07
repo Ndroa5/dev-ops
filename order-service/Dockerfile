@@ -9,6 +9,7 @@ COPY user-service/pom.xml user-service/pom.xml
 COPY catalog-service/pom.xml catalog-service/pom.xml
 COPY order-service/pom.xml order-service/pom.xml
 COPY notification-service/pom.xml notification-service/pom.xml
+COPY e2e-tests/pom.xml e2e-tests/pom.xml
 RUN mvn -q -pl order-service -am dependency:go-offline
 
 COPY order-service/src order-service/src
