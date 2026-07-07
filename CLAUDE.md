@@ -396,15 +396,85 @@ request that any reasonably current Docker Engine accepts).
 
 `.github/workflows/cd.yml` — publishes images to Docker Hub. Two jobs:
 
-1. **`build-and-push`** — matrix over all 5 services. Logs into Docker Hub
-   (`docker/login-action`, using the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets), builds
-   each service's image from its existing `Dockerfile`, tags it two ways, and pushes both tags.
+1. **`build-and-push`** — matrix over all 5 services, on a regular `ubuntu-latest` GitHub-hosted
+   runner. Logs into Docker Hub (`docker/login-action`, using the
+   `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets), builds each service's image from its
+   existing `Dockerfile`, tags it two ways, and pushes both tags.
 2. **`post-deploy-health-check`** — `needs: build-and-push` (only runs once every image is
    pushed). Pulls the just-published images via `docker-compose.prod.yml` and brings up the whole
    stack (`docker compose up -d --wait`), then explicitly curls each of the 5 services'
-   `/actuator/health` endpoint and fails the job if any isn't `UP`. Tears the stack down
-   (`docker compose down -v`) in an `if: always()` step so a failed health check still cleans up
-   instead of leaving containers running on the runner.
+   `/actuator/health` endpoint and fails the job if any isn't `UP`.
+
+**This job runs on a self-hosted runner (a Windows service on the dev machine, `runs-on:
+self-hosted`), not `ubuntu-latest`, and deliberately does not tear the stack down afterward.** A
+GitHub-hosted runner is destroyed the instant its job ends, so anything "deployed" there vanishes
+immediately — the previous version of this job proved the images build and boot, then discarded
+that proof by tearing the stack down in an `if: always()` step. Moving it to a self-hosted runner
+and dropping the teardown step is what makes "automatski deploy nove verzije aplikacije" (spec item
+9) actually true: a merge to `main` now leaves `docker-compose.prod.yml` running and updated on
+this machine, not just health-checked and discarded. This is the **local** deployment path the
+spec explicitly allows as an equal alternative to cloud (item 8) — chosen over a real cloud target
+(Render/Railway/Fly.io) specifically because it reuses infrastructure this project already has
+(this machine, already running Docker for everything else) instead of introducing a new external
+dependency with its own account/free-tier/uptime concerns.
+
+**Verified end-to-end on 2026-07-07**: merged a real PR, watched `build-and-push` publish all 5
+images, watched `post-deploy-health-check` pull them and bring up `docker-compose.prod.yml` on this
+machine, confirmed all 5 health checks passed, then — critically — confirmed the containers were
+still `Up ... (healthy)` *after* the workflow run completed (not torn down), and ran a full
+register → create book → create order → notification smoke test directly against the CD-deployed
+stack on port 9080. All of it worked.
+
+### Setting up the self-hosted runner (one-time, per machine)
+
+1. GitHub repo → Settings → Actions → Runners → New self-hosted runner → Windows/x64. Follow the
+   displayed download/config commands (they include a short-lived registration token).
+2. Install as a persistent Windows service so it survives reboots and doesn't need a terminal open:
+   `./config.cmd --url <repo-url> --token <token> --runasservice` **run from an elevated
+   (Administrator) PowerShell** — the service-install step silently fails with just a warning
+   ("Needs Administrator privileges...") if you're not elevated, while the GitHub-side registration
+   still succeeds, which is a confusing partial-success state if you don't notice the warning.
+3. **Security tradeoff, stated plainly**: a self-hosted runner executes arbitrary code from every
+   future workflow run on this repo, automatically, on this machine. GitHub explicitly warns
+   against this for public repos with external contributors, since a malicious PR's workflow code
+   would run here. Acceptable for this project specifically because it's a solo repo with no
+   external collaborators — revisit if that ever changes.
+
+### Four real, non-obvious problems hit getting the runner to actually work
+
+Each of these produced a passing `build-and-push` (that job runs on `ubuntu-latest`, unaffected)
+followed by a failing `post-deploy-health-check` (the new self-hosted job) — four separate
+merge-and-observe-the-failure cycles before the deploy step actually worked:
+
+1. **`shell: bash` silently resolved to WSL, not Git Bash.** On Windows, the bare `bash` shell
+   keyword resolved to `C:\Windows\System32\bash.exe` (the WSL launcher stub) instead of Git Bash,
+   failing immediately with "Windows Subsystem for Linux has no installed distributions" — this
+   machine has Git Bash but no WSL distro installed. First fix attempt: point `shell:` at Git
+   Bash's actual `.exe` path directly.
+2. **Explicit shell path also failed, for a different reason.** `shell: 'C:\Program
+   Files\Git\usr\bin\bash.exe -e {0}'` failed with `Second path fragment must not be a drive or UNC
+   name` — the runner's custom-shell command parsing splits the shell string on whitespace to
+   separate the executable from its arguments, and "Program Files" has a space in it, so the path
+   itself got torn in half and mis-tokenized. Fixed by abandoning bash entirely for these steps and
+   rewriting them in native PowerShell (`shell: powershell`), which is the Windows runner's actual
+   default and has no such ambiguity.
+3. **PowerShell scripts were blocked outright by the machine's execution policy.** Every `run:`
+   step on a Windows runner is written to a temporary `.ps1` file and dot-sourced; with this
+   machine's `LocalMachine`-scope execution policy left at its out-of-the-box `Undefined` (which
+   behaves as `Restricted`), that dot-sourcing failed with "running scripts is disabled on this
+   system" for *any* PowerShell step, regardless of what the script contained. Fixed with
+   `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine` (elevated) — `RemoteSigned`
+   is the standard baseline for a dev machine: local scripts run freely, downloaded ones need a
+   signature.
+4. **The runner service account had no Docker permission.** Once scripts could actually run, `docker
+   compose pull` failed with `permission denied while trying to connect to the docker API at
+   npipe:////./pipe/docker_engine`. The runner's Windows service logs on as `NT AUTHORITY\NETWORK
+   SERVICE` by default, and Docker Desktop on Windows only grants named-pipe access to members of
+   the local `docker-users` group — which, before this, only had the interactive user account in
+   it. Fixed with `net localgroup docker-users "NT AUTHORITY\NETWORK SERVICE" /add` (elevated),
+   followed by restarting the runner service so its process token actually picks up the new group
+   membership (adding the group alone, without a restart, isn't enough — the already-running
+   service process keeps its original token until restarted).
 
 **Trigger — merge only, not every push**: `on: pull_request: types: [closed], branches: [main]`
 with `if: github.event.pull_request.merged == true` at the job level. A PR that's closed *without*
@@ -442,15 +512,18 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps    # wait for all "healthy"
 ```
-Distinct ports from both the manual dev setup and the build-from-source `docker-compose.yml`, so
-all three can run side by side without conflict: Postgres on **5435**, RabbitMQ on
-**5675**/**15675**, app services on the same **9080-9084** (they're still "the same services").
-Tear down with `docker compose -f docker-compose.prod.yml down -v`.
+Distinct infra ports from both the manual dev setup and the build-from-source `docker-compose.yml`
+(Postgres **5435**, RabbitMQ **5675**/**15675**), but **app service ports (9080-9084) are the same
+across all three setups** since they represent "the same services" — this means this stack and
+the build-from-source `docker-compose.yml` dev stack cannot both be running at once. Since CD now
+keeps this stack running persistently on this machine (see above), the build-from-source dev stack
+should be brought down (`docker compose down`, no `-v` needed) before merging anything, rather than
+left running alongside it. Tear down with `docker compose -f docker-compose.prod.yml down -v` if
+you need to stop the CD-managed deployment itself.
 
-**Not done**: no rollback mechanism, no blue/green or canary deploy, no actual remote server this
-gets deployed to — "deploy" here means "publish images + prove the stack starts and reports
-healthy," not deploying to any real infrastructure. Flagging in case that's expected for a later
-phase or the grading rubric.
+**Not done**: no rollback mechanism, no blue/green or canary deploy. "Deploy" is now a real,
+persistent local deployment (see the self-hosted runner section above) rather than a real remote
+server — still within the spec's explicitly-permitted "local" alternative to cloud, not a gap.
 
 ## Monitoring (phase 6 — done): logs, metrics, and traces
 
@@ -635,9 +708,11 @@ before this workflow started — see the phase plan below for what each of those
    order flow through live containers rather than a single service's Spring context.
 4. **Docker** — done (2026-07-03). See "Docker" section above for the Dockerfile pattern, Compose
    topology, port-mapping distinction from the manual dev setup, and the three real bugs it caught.
-5. **CI/CD** — done (2026-07-03). See "CI" and "CD" sections above — CI builds/tests/build-only
-   Docker images on every push and PR; CD publishes tagged images to Docker Hub and runs a
-   post-deploy health check, triggered only on an actual merge into `main`.
+5. **CI/CD** — done (2026-07-03), CD extended to a real persistent deploy (2026-07-07). See "CI"
+   and "CD" sections above — CI builds/tests/build-only Docker images on every push and PR; CD
+   publishes tagged images to Docker Hub, then (via a self-hosted runner on the dev machine) pulls
+   and runs them via `docker-compose.prod.yml`, leaving the stack actually running and verified
+   healthy instead of tearing it down after the check.
 6. **Monitoring** — done (2026-07-03). See "Monitoring" section above — logs (Promtail/Loki),
    metrics (Prometheus/Grafana), and traces (Zipkin) all wired up and verified end-to-end,
    including two real bugs found while confirming trace propagation (RabbitMQ observation not
