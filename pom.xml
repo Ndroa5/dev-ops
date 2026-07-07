@@ -18,6 +18,7 @@
         <module>catalog-service</module>
         <module>order-service</module>
         <module>notification-service</module>
+        <module>e2e-tests</module>
     </modules>
 
     <properties>

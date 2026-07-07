@@ -1,0 +1,184 @@
+# Dedicated stack for the automated end-to-end test (FullOrderFlowE2ETest). Deliberately a separate
+# file from the root docker-compose.yml, on a distinct port range (service ports 9180-9184, Postgres
+# 5436, RabbitMQ 5676/15676), so this can run in CI or alongside a developer's already-running dev
+# stack (docker-compose.yml, ports 9080-9084) without any port collision. No container_name is set
+# on any service, so Testcontainers' Docker Compose module can freely assign a unique per-run project
+# name/container names instead of colliding with the dev stack's fixed names (e.g. "user-service").
+# No observability stack (Zipkin/Prometheus/Loki) here - this file exists purely to prove the business
+# flow works end-to-end across real containers, not to re-test monitoring (already covered elsewhere).
+
+networks:
+  e2e-network:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5436:5432"
+    volumes:
+      - ../docker/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_ERLANG_COOKIE: e2e-test-cookie
+    ports:
+      - "5676:5672"
+      - "15676:15672"
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+
+  user-service:
+    build:
+      context: ..
+      dockerfile: user-service/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      JWT_SECRET: e2e-test-secret-key-not-for-production-use-only
+    ports:
+      - "9181:9081"
+    networks:
+      - e2e-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  catalog-service:
+    build:
+      context: ..
+      dockerfile: catalog-service/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+    ports:
+      - "9182:9082"
+    networks:
+      - e2e-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  order-service:
+    build:
+      context: ..
+      dockerfile: order-service/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: guest
+      RABBITMQ_PASSWORD: guest
+      CATALOG_SERVICE_URL: http://catalog-service:9082
+    ports:
+      - "9183:9083"
+    networks:
+      - e2e-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  notification-service:
+    build:
+      context: ..
+      dockerfile: notification-service/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: guest
+      RABBITMQ_PASSWORD: guest
+    ports:
+      - "9184:9084"
+    networks:
+      - e2e-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9084/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: api-gateway/Dockerfile
+    environment:
+      USER_SERVICE_URL: http://user-service:9081
+      CATALOG_SERVICE_URL: http://catalog-service:9082
+      ORDER_SERVICE_URL: http://order-service:9083
+      NOTIFICATION_SERVICE_URL: http://notification-service:9084
+    ports:
+      - "9180:9080"
+    networks:
+      - e2e-network
+    depends_on:
+      user-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
