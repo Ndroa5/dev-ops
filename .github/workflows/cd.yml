@@ -70,34 +70,44 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
 
-      # Explicit path, not the bare `bash` shell keyword: on this Windows self-hosted runner,
-      # `shell: bash` resolved to C:\Windows\System32\bash.exe (the WSL launcher stub) instead of
-      # Git Bash, and failed immediately with "Windows Subsystem for Linux has no installed
-      # distributions" since no WSL distro is installed on this machine - only Git Bash is.
+      # Native PowerShell, not bash: the bare `shell: bash` keyword resolved to
+      # C:\Windows\System32\bash.exe (the WSL launcher stub, no distro installed) instead of Git
+      # Bash on this Windows runner, and pointing `shell:` at Git Bash's actual .exe path directly
+      # also failed - the runner's custom-shell parsing splits the shell command on whitespace,
+      # and "C:\Program Files\Git\..." has a space in "Program Files", so it got mis-tokenized
+      # ("Second path fragment must not be a drive or UNC name"). Native PowerShell (the Windows
+      # runner's actual default shell) sidesteps both problems entirely.
       - name: Compute short SHA tag
-        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
+        shell: powershell
         run: |
-          SHA="${{ github.event.pull_request.merge_commit_sha }}"
-          echo "TAG=${SHA:0:7}" >> "$GITHUB_ENV"
+          $sha = "${{ github.event.pull_request.merge_commit_sha }}"
+          $short = $sha.Substring(0, 7)
+          "TAG=$short" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Pull freshly-published images and (re)start the stack
-        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
+        shell: powershell
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           docker compose -f docker-compose.prod.yml pull
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           docker compose -f docker-compose.prod.yml up -d --wait --wait-timeout 180
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Hit each service's /actuator/health endpoint
-        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
+        shell: powershell
         run: |
-          set -e
-          for port in 9080 9081 9082 9083 9084; do
-            echo "Checking service on port ${port}..."
-            status=$(curl -sf "http://localhost:${port}/actuator/health" | tee /dev/stderr | grep -o '"status":"[A-Z]*"')
-            echo "$status" | grep -q '"status":"UP"' || { echo "Service on port ${port} is not UP"; exit 1; }
-          done
-          echo "All 5 services report UP."
+          $ports = 9080, 9081, 9082, 9083, 9084
+          foreach ($port in $ports) {
+            Write-Host "Checking service on port $port..."
+            $response = Invoke-RestMethod -Uri "http://localhost:$port/actuator/health"
+            Write-Host ($response | ConvertTo-Json -Compress)
+            if ($response.status -ne "UP") {
+              Write-Host "Service on port $port is not UP"
+              exit 1
+            }
+          }
+          Write-Host "All 5 services report UP."
 
       # Deliberately no teardown step here anymore - the whole point of moving this job to a
       # self-hosted runner was to leave the freshly-deployed stack running instead of discarding
