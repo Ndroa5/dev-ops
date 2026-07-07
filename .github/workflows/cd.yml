@@ -70,14 +70,18 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
 
+      # Explicit path, not the bare `bash` shell keyword: on this Windows self-hosted runner,
+      # `shell: bash` resolved to C:\Windows\System32\bash.exe (the WSL launcher stub) instead of
+      # Git Bash, and failed immediately with "Windows Subsystem for Linux has no installed
+      # distributions" since no WSL distro is installed on this machine - only Git Bash is.
       - name: Compute short SHA tag
-        shell: bash
+        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
         run: |
           SHA="${{ github.event.pull_request.merge_commit_sha }}"
           echo "TAG=${SHA:0:7}" >> "$GITHUB_ENV"
 
       - name: Pull freshly-published images and (re)start the stack
-        shell: bash
+        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
@@ -85,7 +89,7 @@ jobs:
           docker compose -f docker-compose.prod.yml up -d --wait --wait-timeout 180
 
       - name: Hit each service's /actuator/health endpoint
-        shell: bash
+        shell: 'C:\Program Files\Git\usr\bin\bash.exe -e {0}'
         run: |
           set -e
           for port in 9080 9081 9082 9083 9084; do
